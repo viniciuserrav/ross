@@ -79,6 +79,7 @@ from ross.utils import (
 )
 
 from ross.harmonic_balance import HarmonicBalance
+from ross.mesh_convergence import mesh_convergence
 
 __all__ = [
     "Rotor",
@@ -1831,6 +1832,72 @@ class Rotor(object):
         results = ConvergenceResults(el_num[1:], eigv_arr[1:], error_arr[1:])
 
         return results
+
+    @check_units
+    def run_mesh_convergence(
+        self,
+        rtol=1e-3,
+        frequencies=6,
+        strategy="cheapest",
+        speed=0,
+        max_elements=1000,
+    ):
+        """Find a shaft discretization with converged natural frequencies.
+
+        The shaft intervals of the rotor (the lengths between consecutive shaft
+        nodes) are split into equal elements (see :py:meth:`refine`) until the
+        lowest natural frequencies are within ``rtol`` of a converged reference.
+        The reference is found by halving the length of the elements until the
+        frequencies change less than ``rtol / 10``. The k-th lowest natural
+        frequency of a discretization is compared with the k-th lowest
+        frequency of the reference.
+
+        Two families of discretizations are searched:
+
+        - uniform: every element is at most ``h`` long;
+        - graded: every element is at most a fraction of the local bending
+          wavelength at the highest reference frequency, so thin sections get
+          shorter elements than thick ones.
+
+        The shaft elements of the rotor are the coarsest discretization
+        considered: they are split, never merged. The rotor is not modified.
+
+        Parameters
+        ----------
+        rtol : float, optional
+            Maximum relative error of the natural frequencies against the
+            reference. Default is 1e-3 (0.1%).
+        frequencies : int, optional
+            Number of natural frequencies (the lowest ones) that must converge.
+            Default is 6.
+        strategy : str, optional
+            "cheapest" returns the discretization with the fewest shaft
+            elements found in both families, and "uniform" searches the uniform
+            family only. Default is "cheapest".
+        speed : float, pint.Quantity, optional
+            Rotor speed of the modal analyses (rad/s). Default is 0.
+        max_elements : int, optional
+            Maximum number of shaft elements of the discretizations evaluated.
+            Default is 1000.
+
+        Returns
+        -------
+        results : ross.MeshConvergenceResults
+            For more information on attributes and methods available see:
+            :py:class:`ross.MeshConvergenceResults`. The rotor with the chosen
+            discretization is ``results.rotor``.
+
+        Examples
+        --------
+        >>> rotor = rotor_example()
+        >>> results = rotor.run_mesh_convergence(rtol=1e-4)
+        >>> len(rotor.shaft_elements), len(results.rotor.shaft_elements)
+        (6, 12)
+        >>> bool(results.error.max() <= 1e-4)
+        True
+        >>> fig = results.plot()
+        """
+        return mesh_convergence(self, rtol, frequencies, strategy, speed, max_elements)
 
     def M(self, frequency=None, speed=None, synchronous=False):
         """Mass matrix for an instance of a rotor.
