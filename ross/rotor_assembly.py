@@ -1216,6 +1216,113 @@ class Rotor(object):
             **self._init_parameters(),
         )
 
+    def refine(self, subdivisions):
+        """Split the shaft intervals of the rotor in equal shaft elements.
+
+        An interval is the length between two consecutive shaft nodes. Every
+        shaft element of an interval (more than one in layered shafts) is split
+        in the same number of equal elements, and the diameters of tapered
+        elements are interpolated along the length. Disks, bearings, seals and
+        point masses keep their positions, and the nodes off the shaft (e.g.
+        bearing housings) are renumbered after the new shaft nodes. Intervals
+        holding a coupling element are not split.
+
+        Parameters
+        ----------
+        subdivisions : int, array_like
+            Number of elements each interval is split into, either one value for
+            every interval or a single value for all of them.
+
+        Returns
+        -------
+        rotor : ross.Rotor
+            A new rotor with the refined shaft. The original rotor is not
+            modified.
+
+        Examples
+        --------
+        >>> rotor = rotor_example()
+        >>> refined = rotor.refine(4)
+        >>> len(rotor.shaft_elements), len(refined.shaft_elements)
+        (6, 24)
+        >>> [disk.n for disk in refined.disk_elements]
+        [8, 16]
+        >>> bool(np.isclose(refined.m, rotor.m))
+        True
+        """
+        if type(self) is not Rotor:
+            raise NotImplementedError(
+                f"refine is not available for {type(self).__name__}, only for Rotor."
+            )
+
+        first_node = min(elm.n for elm in self.shaft_elements)
+        n_intervals = max(elm.n for elm in self.shaft_elements) - first_node + 1
+
+        subdivisions = np.asarray(subdivisions)
+        if subdivisions.ndim == 0:
+            subdivisions = np.full(n_intervals, subdivisions)
+        if subdivisions.shape != (n_intervals,):
+            raise ValueError(
+                "subdivisions must be a single value or have one value for each "
+                f"of the {n_intervals} shaft intervals."
+            )
+        if np.any(subdivisions < 1) or np.any(subdivisions % 1 != 0):
+            raise ValueError("subdivisions must be integers greater than zero.")
+        subdivisions = subdivisions.astype(int)
+        for elm in self.shaft_elements:
+            if isinstance(elm, CouplingElement):
+                subdivisions[elm.n - first_node] = 1
+
+        added_nodes = np.concatenate(([0], np.cumsum(subdivisions - 1)))
+        last_node = first_node + n_intervals
+
+        def new_node(node):
+            if node <= last_node:
+                return int(node + added_nodes[node - first_node])
+            return int(node + added_nodes[-1])
+
+        shaft_elements = []
+        for elm in self.shaft_elements:
+            n_split = subdivisions[elm.n - first_node]
+            if n_split == 1:
+                new_elm = deepcopy(elm)
+                new_elm.n = new_node(elm.n)
+                new_elm.tag = None
+                shaft_elements.append(new_elm)
+                continue
+
+            fraction = np.linspace(0, 1, n_split + 1)
+            idl = elm.idl + (elm.idr - elm.idl) * fraction
+            odl = elm.odl + (elm.odr - elm.odl) * fraction
+            for j in range(n_split):
+                shaft_elements.append(
+                    elm.copy(
+                        L=elm.L / n_split,
+                        idl=idl[j],
+                        idr=idl[j + 1],
+                        odl=odl[j],
+                        odr=odl[j + 1],
+                        n=new_node(elm.n) + j,
+                    )
+                )
+
+        disk_elements = deepcopy(self.disk_elements)
+        bearing_elements = deepcopy(self.bearing_elements)
+        point_mass_elements = deepcopy(self.point_mass_elements)
+        for elm in [*disk_elements, *bearing_elements, *point_mass_elements]:
+            elm.n = new_node(elm.n)
+        for elm in bearing_elements:
+            if elm.n_link is not None:
+                elm.n_link = new_node(elm.n_link)
+
+        return self.__class__(
+            shaft_elements,
+            disk_elements=disk_elements,
+            bearing_elements=bearing_elements,
+            point_mass_elements=point_mass_elements,
+            **self._init_parameters(),
+        )
+
     def add_elements(self, new_elements):
         """Add elements to rotor.
 
@@ -1648,7 +1755,8 @@ class Rotor(object):
         """Run convergence analysis.
 
         Function to analyze the eigenvalues convergence through the number of
-        shaft elements. Every new run doubles the number of shaft elements.
+        shaft elements. Every new run doubles the number of shaft elements
+        (see :py:meth:`refine`).
 
         Parameters
         ----------
@@ -1706,60 +1814,11 @@ class Rotor(object):
         nel_r = 2
 
         while error > err_max:
-            shaft_elem = []
-            disk_elem = []
-            brgs_elem = []
-            pmass_elem = []
-
-            for shaft in self.shaft_elements:
-                le = shaft.L / nel_r
-                odl = shaft.odl
-                odr = shaft.odr
-                idl = shaft.idl
-                idr = shaft.idr
-
-                # loop to double the number of element
-                for j in range(nel_r):
-                    odr = ((nel_r - j - 1) * odl + (j + 1) * odr) / nel_r
-                    idr = ((nel_r - j - 1) * idl + (j + 1) * idr) / nel_r
-                    odl = ((nel_r - j) * odl + j * odr) / nel_r
-                    idl = ((nel_r - j) * idl + j * idr) / nel_r
-                    shaft_elem.append(
-                        ShaftElement(
-                            L=le,
-                            idl=idl,
-                            odl=odl,
-                            idr=idr,
-                            odr=odr,
-                            material=shaft.material,
-                            shear_effects=shaft.shear_effects,
-                            rotary_inertia=shaft.rotary_inertia,
-                            gyroscopic=shaft.gyroscopic,
-                        )
-                    )
-
-            for elm in self.disk_elements:
-                aux_elm = deepcopy(elm)
-                aux_elm.n = nel_r * elm.n
-                disk_elem.append(aux_elm)
-
-            for elm in self.bearing_elements:
-                aux_elm = deepcopy(elm)
-                aux_elm.n = nel_r * elm.n
-                if aux_elm.n_link is not None:
-                    aux_elm.n_link = nel_r * elm.n_link
-                brgs_elem.append(aux_elm)
-
-            for elm in self.point_mass_elements:
-                aux_elm = deepcopy(elm)
-                aux_elm.n = nel_r * elm.n
-                pmass_elem.append(aux_elm)
-
-            aux_rotor = Rotor(shaft_elem, disk_elem, brgs_elem, pmass_elem)
+            aux_rotor = self.refine(nel_r)
             aux_modal = aux_rotor.run_modal(speed=0)
 
             eigv_arr = np.append(eigv_arr, aux_modal.wn[n_eigval])
-            el_num = np.append(el_num, len(shaft_elem))
+            el_num = np.append(el_num, len(aux_rotor.shaft_elements))
 
             error = abs(1 - eigv_arr[-1] / eigv_arr[-2])
 
